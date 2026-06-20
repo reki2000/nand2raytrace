@@ -142,37 +142,3 @@ func TestCounter16(t *testing.T) {
 		t.Errorf("After hold: %d, want 13", got)
 	}
 }
-
-func TestMemory(t *testing.T) {
-	mi := NewMemoryInterface()
-	mem := NewMemory(65536, mi)
-
-	// Write word 0xABCD at address 0x100
-	mi.Addr.SetVal(0x100)
-	mi.WData.SetVal(0xABCD)
-	mi.MemWrite.Val = true
-	mi.ByteMode.Val = false
-	mem.Eval()
-	mi.MemWrite.Val = false
-
-	// Read word
-	mi.MemRead.Val = true
-	mem.Eval()
-	if got := mi.RData.GetVal(); got != 0xABCD {
-		t.Errorf("Word read = 0x%X, want 0xABCD", got)
-	}
-
-	// Read byte (low)
-	mi.ByteMode.Val = true
-	mem.Eval()
-	if got := mi.RData.GetVal(); got != 0xCD {
-		t.Errorf("Byte read low = 0x%X, want 0xCD", got)
-	}
-
-	// Read byte (high)
-	mi.Addr.SetVal(0x101)
-	mem.Eval()
-	if got := mi.RData.GetVal(); got != 0xAB {
-		t.Errorf("Byte read high = 0x%X, want 0xAB", got)
-	}
-}

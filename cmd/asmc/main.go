@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"os"
 
-	"nand16"
+	"nand16/internal/asmc"
 )
 
 func main() {
 	out := flag.String("o", "", "output .bin file (default: stdout filename based)")
+	base := flag.Int("base", 0, "load address for label/offset resolution (e.g. 0x0200)")
 	flag.Parse()
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "usage: asmc [-o out.bin] input.s\n")
+		fmt.Fprintf(os.Stderr, "usage: asmc [-o out.bin] [-base 0x0200] input.s\n")
 		os.Exit(1)
 	}
 	src, err := os.ReadFile(flag.Arg(0))
@@ -20,7 +21,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "read: %v\n", err)
 		os.Exit(1)
 	}
-	bin, err := nand16.Assemble(string(src))
+	bin, err := asmc.AssembleAt(string(src), *base)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "assemble: %v\n", err)
 		os.Exit(1)

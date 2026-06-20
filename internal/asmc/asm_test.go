@@ -1,7 +1,11 @@
-package nand16
+package asmc
 
 import (
 	"bytes"
+	"fmt"
+	"nand16/internal/cpu"
+	"nand16/internal/memory"
+	"nand16/internal/system"
 	"testing"
 )
 
@@ -17,10 +21,9 @@ func TestAssembler_Basic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mi := NewMemoryInterface()
-	mem := NewMemory(65536, mi)
+	mem := memory.NewMemory(65536)
 	mem.LoadBinary(0, code)
-	cpu := NewCPU(mem)
+	cpu := cpu.NewCPU(mem)
 	cpu.PC = 0
 	cpu.Run(10)
 
@@ -44,10 +47,9 @@ loop:
 		t.Fatal(err)
 	}
 
-	mi := NewMemoryInterface()
-	mem := NewMemory(65536, mi)
+	mem := memory.NewMemory(65536)
 	mem.LoadBinary(0, code)
-	cpu := NewCPU(mem)
+	cpu := cpu.NewCPU(mem)
 	cpu.PC = 0
 	cpu.Run(200)
 
@@ -58,20 +60,11 @@ loop:
 
 func TestAssembler_HelloWorld(t *testing.T) {
 	src := `
-	; Print "Hi" via SYSCALL putchar
-	addi r1, r0, 1     ; syscall 1 = putchar
-	addi r2, r0, 72    ; 'H' = 72
-	syscall
-	addi r2, r0, 105   ; 'i' = 105... but 105 > 31! 
-`
-	// 105 doesn't fit in imm6. Need to build it differently.
-	// Let's use a simpler test: print chars that fit in imm6
-
-	src = `
-	; Print "!" via SYSCALL putchar
-	addi r1, r0, 1     ; syscall 1 = putchar
-	addi r2, r0, 10    ; newline
-	syscall
+	; Print a newline by writing it to the UART data port (MMIO).
+	; UART data lives at 0xF800; build the address via LUI.
+	addi r2, r0, 10    ; newline char
+	lui  r1, -2        ; r1 = (0x3E << 10) = 0xF800
+	sb   r2, 0(r1)     ; mem[0xF800] = '\n' -> UART -> stdout
 	halt
 `
 	code, err := Assemble(src)
@@ -79,7 +72,7 @@ func TestAssembler_HelloWorld(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sys := NewSystem()
+	sys := system.NewSystem()
 	sys.LoadRAM(0, code)
 	sys.CPU.PC = 0
 	var out bytes.Buffer
@@ -116,7 +109,7 @@ func TestSystem_UART(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sys := NewSystem()
+	sys := system.NewSystem()
 	sys.LoadRAM(0, code)
 	sys.CPU.PC = 0
 	var out bytes.Buffer
@@ -125,6 +118,66 @@ func TestSystem_UART(t *testing.T) {
 
 	if out.String() != "A" {
 		t.Errorf("UART output=%q, want 'A'", out.String())
+	}
+}
+
+func TestAssembler_LoadImmediate(t *testing.T) {
+	// li must construct arbitrary 16-bit values, exercising every expandLI path:
+	// imm6, 2-ADDI, LUI shortcut, and the general shift-based sequence.
+	cases := []struct {
+		val  int
+		want uint16
+	}{
+		{0, 0},
+		{31, 31},
+		{-32, 0xFFE0},    // imm6 negative
+		{50, 50},         // 2-ADDI positive
+		{-50, 0xFFCE},    // 2-ADDI negative
+		{0xF000, 0xF000}, // LUI shortcut
+		{0xEF00, 0xEF00}, // general path (forth SP)
+		{0xDF00, 0xDF00}, // general path (forth RSP)
+		{12345, 12345},   // general path
+		{0xFFFF, 0xFFFF}, // all ones
+		{256, 256},       // hi=1, lo=0
+		{0x0101, 0x0101}, // hi=1, lo=1
+	}
+	for _, c := range cases {
+		src := fmt.Sprintf("li r1, %d\nhalt\n", c.val)
+		code, err := Assemble(src)
+		if err != nil {
+			t.Fatalf("li %d: assemble error: %v", c.val, err)
+		}
+			mem := memory.NewMemory(65536)
+		mem.LoadBinary(0, code)
+		cpu := cpu.NewCPU(mem)
+		cpu.PC = 0
+		cpu.Run(50)
+		if cpu.Regs[1] != c.want {
+			t.Errorf("li r1, %d -> R1=0x%04X (%d), want 0x%04X", c.val, cpu.Regs[1], cpu.Regs[1], c.want)
+		}
+	}
+}
+
+func TestAssembler_LoadImmediateLabelsConsistent(t *testing.T) {
+	// A variable-length li before a label must not desync pass1/pass2 addresses.
+	src := `
+	li   r1, 12345    ; multi-instruction expansion
+	jal  skip
+	addi r1, r0, 7    ; must be skipped
+skip:
+	halt
+`
+	code, err := Assemble(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := memory.NewMemory(65536)
+	mem.LoadBinary(0, code)
+	cpu := cpu.NewCPU(mem)
+	cpu.PC = 0
+	cpu.Run(50)
+	if cpu.Regs[1] != 12345 {
+		t.Errorf("label after li: R1=%d, want 12345 (jal target miscomputed?)", cpu.Regs[1])
 	}
 }
 
@@ -150,10 +203,9 @@ mul_done:
 		t.Fatal(err)
 	}
 
-	mi := NewMemoryInterface()
-	mem := NewMemory(65536, mi)
+	mem := memory.NewMemory(65536)
 	mem.LoadBinary(0, code)
-	cpu := NewCPU(mem)
+	cpu := cpu.NewCPU(mem)
 	cpu.PC = 0
 	cpu.Run(200)
 

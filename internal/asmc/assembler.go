@@ -1,7 +1,8 @@
-package nand16
+package asmc
 
 import (
 	"fmt"
+	"nand16/internal/op"
 	"strconv"
 	"strings"
 )
@@ -10,14 +11,27 @@ import (
 type Assembler struct {
 	labels map[string]int
 	errors []string
+	base   int // address the emitted code will be loaded at (label origin)
 }
 
-// Assemble translates assembly source to binary.
+// Assemble translates assembly source to binary loaded at address 0.
 func Assemble(source string) ([]byte, error) {
-	a := &Assembler{labels: make(map[string]int)}
+	return AssembleAt(source, 0)
+}
+
+// AssembleAt translates assembly source to binary, resolving labels and
+// PC-relative offsets as if the code were loaded at the given base address.
+// The returned bytes are not padded; the caller loads them at base.
+func AssembleAt(source string, base int) ([]byte, error) {
+	a := &Assembler{labels: make(map[string]int), base: base}
 	lines := a.tokenize(source)
 
+	// Relaxation: decide which `call`s need the long-call trampoline.
+	a.relaxCalls(lines)
+
 	// Pass 1: collect labels
+	a.labels = make(map[string]int)
+	a.errors = nil
 	a.pass1(lines)
 	if len(a.errors) > 0 {
 		return nil, fmt.Errorf("pass1: %s", strings.Join(a.errors, "; "))
@@ -32,12 +46,67 @@ func Assemble(source string) ([]byte, error) {
 	return code, nil
 }
 
+// relaxCalls iteratively marks `call` instructions whose JAL offset falls out of
+// range, so they are emitted as the long-call trampoline. Marking only ever
+// grows (long calls take more space, which can push later calls out of range),
+// so the fixpoint is reached monotonically.
+func (a *Assembler) relaxCalls(lines []asmLine) {
+	for iter := 0; iter < len(lines)+2; iter++ {
+		a.labels = make(map[string]int)
+		a.errors = nil
+		a.pass1(lines)
+
+		changed := false
+		pc := a.base
+		for i := range lines {
+			l := &lines[i]
+			if l.op == "" {
+				continue
+			}
+			if l.op == "call" && !l.callLong && len(l.args) >= 1 {
+				target := a.lookupOrParse(l.args[0])
+				if !jumpInRange(wordOffset(pc, target)) {
+					l.callLong = true
+					changed = true
+				}
+			}
+			pc += a.instrSize(*l)
+		}
+		if !changed {
+			break
+		}
+	}
+	a.errors = nil // discard transient relaxation errors
+}
+
+// lookupOrParse resolves a label or numeric literal without recording errors;
+// unknown symbols resolve to 0 (the real error surfaces in pass2).
+func (a *Assembler) lookupOrParse(s string) int {
+	s = strings.TrimSpace(s)
+	if v, ok := a.labels[s]; ok {
+		return v
+	}
+	t := strings.ToLower(s)
+	base := 10
+	if strings.HasPrefix(t, "0x") {
+		t, base = t[2:], 16
+	} else if strings.HasPrefix(t, "0b") {
+		t, base = t[2:], 2
+	}
+	v, err := strconv.ParseInt(t, base, 32)
+	if err != nil {
+		return 0
+	}
+	return int(v)
+}
+
 type asmLine struct {
-	lineNo int
-	label  string
-	op     string
-	args   []string
-	orig   string
+	lineNo   int
+	label    string
+	op       string
+	args     []string
+	orig     string
+	callLong bool // resolved by relaxCalls: emit the long-call trampoline
 }
 
 var regMap = map[string]int{
@@ -86,7 +155,7 @@ func (a *Assembler) tokenize(source string) []asmLine {
 }
 
 func (a *Assembler) pass1(lines []asmLine) {
-	pc := 0
+	pc := a.base
 	for _, l := range lines {
 		if l.label != "" {
 			a.labels[l.label] = pc
@@ -117,8 +186,18 @@ func (a *Assembler) instrSize(l asmLine) int {
 			return len(s) + 1
 		}
 		return 1
-	case "li": // pseudo: LUI + ORI = 4 bytes
-		return 4
+	case "li": // pseudo: variable-length load of a 16-bit immediate
+		if len(l.args) < 2 {
+			return 0
+		}
+		rd := a.parseReg(l, l.args[0])
+		imm := a.parseImm(l, l.args[1])
+		return len(expandLI(rd, imm)) * 2
+	case "call": // pseudo: jal when in range, else the long-call trampoline
+		if l.callLong {
+			return longCallWords * 2
+		}
+		return 2
 	default:
 		return 2
 	}
@@ -126,7 +205,7 @@ func (a *Assembler) instrSize(l asmLine) int {
 
 func (a *Assembler) pass2(lines []asmLine) []byte {
 	code := make([]byte, 0, 1024)
-	pc := 0
+	pc := a.base
 	for _, l := range lines {
 		if l.op == "" {
 			continue
@@ -148,7 +227,7 @@ func (a *Assembler) pass2(lines []asmLine) []byte {
 		case ".dw":
 			for _, arg := range l.args {
 				v := uint16(a.parseImm(l, arg))
-				code = append(code, byte(v), byte(v>>8))
+				code = appendWordLE(code, v)
 				pc += 2
 			}
 
@@ -168,64 +247,55 @@ func (a *Assembler) pass2(lines []asmLine) []byte {
 			}
 
 		case "li":
-			// Pseudo-instruction: LI rd, imm16 -> LUI rd, hi6 ; ORI rd, rd, lo10
-			// Actually: LUI loads imm6<<10. We need: upper 6 bits + lower 10.
-			// But ORI imm6 is only 6 bits. So we can only load imm6<<10 | imm6.
-			// Better: LUI rd, upper6; ADDI rd, rd, lower_signed
+			// Pseudo-instruction: load a 16-bit immediate via expandLI.
 			rd := a.parseReg(l, l.args[0])
 			imm := a.parseImm(l, l.args[1])
-			upper := (imm >> 10) & 0x3F
-			lower := imm & 0x3FF
-			// If lower >= 512, it's negative when sign-extended from 10 bits
-			// But our ADDI only has 6-bit immediate...
-			// Simpler approach: LUI sets bits[15:10], then ORI sets bits[5:0]
-			// Bits [9:6] are lost. 
-			// Alternative: LUI rd, upper; ORI rd, rd, lo6  (only covers 12 bits)
-			// For full 16-bit: LUI rd, upper6; ORI rd, rd, mid6...
-			// This ISA limitation means LI can only construct certain values.
-			// Let's use: LUI for upper, ADDI for lower (sign-extended 6-bit)
-			// upper6 << 10 + sign_ext(lower6)
-			// For arbitrary 16-bit: may need more instructions.
-			// Practical: LUI + ORI covers bits [15:10] | [5:0]
-			// Use shifts for full range. For now, support common cases.
-			lo6 := lower & 0x3F
-			_ = upper
-			w1 := EncodeI(OpLUI, rd, 0, upper)
-			w2 := EncodeI(OpORI, rd, rd, lo6)
-			code = append(code, byte(w1), byte(w1>>8))
-			code = append(code, byte(w2), byte(w2>>8))
-			pc += 4
+			for _, w := range expandLI(rd, imm) {
+				code = appendWordLE(code, w)
+				pc += 2
+			}
+
+		case "call":
+			// Pseudo-instruction: jal when in range, else long-call trampoline.
+			target := a.parseImm(l, l.args[0])
+			if l.callLong {
+				for _, w := range longCall(target) {
+					code = appendWordLE(code, w)
+					pc += 2
+				}
+			} else {
+				off := wordOffset(pc, target)
+				if !jumpInRange(off) {
+					a.errorf(l, "call offset %d out of range", off)
+				}
+				code = appendWordLE(code, op.EncodeJ(op.OpJAL, off))
+				pc += 2
+			}
 
 		case "nop":
-			w := EncodeR(OpSYSTEM, 0, 0, 0, 7)
-			code = append(code, byte(w), byte(w>>8))
+			code = appendWordLE(code, op.EncodeR(op.OpSYSTEM, 0, 0, 0, 7))
 			pc += 2
 
 		case "halt":
-			w := EncodeR(OpSYSTEM, 0, 0, 0, 1)
-			code = append(code, byte(w), byte(w>>8))
+			code = appendWordLE(code, op.EncodeR(op.OpSYSTEM, 0, 0, 0, 1))
 			pc += 2
 
 		case "syscall":
-			w := EncodeR(OpSYSTEM, 0, 0, 0, 2)
-			code = append(code, byte(w), byte(w>>8))
+			code = appendWordLE(code, op.EncodeR(op.OpSYSTEM, 0, 0, 0, 2))
 			pc += 2
 
 		case "ret":
-			w := EncodeR(OpSYSTEM, 0, 7, 0, 0) // JALR R7
-			code = append(code, byte(w), byte(w>>8))
+			code = appendWordLE(code, op.EncodeR(op.OpSYSTEM, 0, 7, 0, 0)) // JALR R7
 			pc += 2
 
 		case "mov":
 			rd := a.parseReg(l, l.args[0])
 			rs := a.parseReg(l, l.args[1])
-			w := EncodeR(OpALU, rd, rs, 0, 0) // ADD rd, rs, R0
-			code = append(code, byte(w), byte(w>>8))
+			code = appendWordLE(code, op.EncodeR(op.OpALU, rd, rs, 0, 0)) // ADD rd, rs, R0
 			pc += 2
 
 		default:
-			w := a.encodeInstr(l, pc)
-			code = append(code, byte(w), byte(w>>8))
+			code = appendWordLE(code, a.encodeInstr(l, pc))
 			pc += 2
 		}
 	}
@@ -236,68 +306,66 @@ func (a *Assembler) encodeInstr(l asmLine, pc int) uint16 {
 	switch l.op {
 	// R-type: op rd, rs1, rs2
 	case "add":
-		return a.rtype(l, OpALU, 0)
+		return a.rtype(l, op.OpALU, 0)
 	case "sub":
-		return a.rtype(l, OpALU, 1)
+		return a.rtype(l, op.OpALU, 1)
 	case "and":
-		return a.rtype(l, OpALU, 2)
+		return a.rtype(l, op.OpALU, 2)
 	case "or":
-		return a.rtype(l, OpALU, 3)
+		return a.rtype(l, op.OpALU, 3)
 	case "xor":
-		return a.rtype(l, OpALU, 4)
+		return a.rtype(l, op.OpALU, 4)
 	case "shl":
-		return a.rtype(l, OpALU, 5)
+		return a.rtype(l, op.OpALU, 5)
 	case "shr":
-		return a.rtype(l, OpALU, 6)
+		return a.rtype(l, op.OpALU, 6)
 	case "sra":
-		return a.rtype(l, OpALU, 7)
+		return a.rtype(l, op.OpALU, 7)
 	case "mul":
-		return a.rtype(l, OpMUL, 0)
+		return a.rtype(l, op.OpMUL, 0)
 	case "mulh":
-		return a.rtype(l, OpMUL, 1)
+		return a.rtype(l, op.OpMUL, 1)
 
 	// I-type: op rd, rs1, imm6
 	case "addi":
-		return a.itype(l, OpADDI)
+		return a.itype(l, op.OpADDI)
 	case "andi":
-		return a.itype(l, OpANDI)
+		return a.itype(l, op.OpANDI)
 	case "ori":
-		return a.itype(l, OpORI)
+		return a.itype(l, op.OpORI)
 	case "lui":
 		rd := a.parseReg(l, l.args[0])
 		imm := a.parseImm(l, l.args[1])
-		return EncodeI(OpLUI, rd, 0, imm&0x3F)
+		return op.EncodeI(op.OpLUI, rd, 0, imm&0x3F)
 
 	// Load/Store: op rd, imm6(rs1)  or  op rd, rs1, imm6
 	case "lw":
-		return a.loadStore(l, OpLW)
+		return a.loadStore(l, op.OpLW)
 	case "sw":
-		return a.storeInstr(l, OpSW)
+		return a.storeInstr(l, op.OpSW)
 	case "lb":
-		return a.loadStore(l, OpLB)
+		return a.loadStore(l, op.OpLB)
 	case "sb":
-		return a.storeInstr(l, OpSB)
+		return a.storeInstr(l, op.OpSB)
 
 	// Branch: op rs1, rs2, label
 	case "beq":
-		return a.branch(l, OpBEQ, pc)
+		return a.branch(l, op.OpBEQ, pc)
 	case "bne":
-		return a.branch(l, OpBNE, pc)
+		return a.branch(l, op.OpBNE, pc)
 	case "blt":
-		return a.branch(l, OpBLT, pc)
+		return a.branch(l, op.OpBLT, pc)
 	case "bge":
-		return a.branch(l, OpBGE, pc)
+		return a.branch(l, op.OpBGE, pc)
 
 	// Jump
 	case "jal":
-		return a.jump(l, OpJAL, pc)
+		return a.jump(l, op.OpJAL, pc)
 	case "jalr":
 		rs := a.parseReg(l, l.args[0])
-		return EncodeR(OpSYSTEM, 0, rs, 0, 0)
+		return op.EncodeR(op.OpSYSTEM, 0, rs, 0, 0)
 	case "j": // pseudo: JAL with no link needed (still saves to R7)
-		return a.jump(l, OpJAL, pc)
-	case "call": // pseudo: same as JAL
-		return a.jump(l, OpJAL, pc)
+		return a.jump(l, op.OpJAL, pc)
 
 	default:
 		a.errorf(l, "unknown instruction: %s", l.op)
@@ -305,7 +373,7 @@ func (a *Assembler) encodeInstr(l asmLine, pc int) uint16 {
 	}
 }
 
-func (a *Assembler) rtype(l asmLine, op, fn int) uint16 {
+func (a *Assembler) rtype(l asmLine, opcode, fn int) uint16 {
 	if len(l.args) < 3 {
 		a.errorf(l, "%s needs 3 args", l.op)
 		return 0
@@ -313,10 +381,10 @@ func (a *Assembler) rtype(l asmLine, op, fn int) uint16 {
 	rd := a.parseReg(l, l.args[0])
 	rs1 := a.parseReg(l, l.args[1])
 	rs2 := a.parseReg(l, l.args[2])
-	return EncodeR(op, rd, rs1, rs2, fn)
+	return op.EncodeR(opcode, rd, rs1, rs2, fn)
 }
 
-func (a *Assembler) itype(l asmLine, op int) uint16 {
+func (a *Assembler) itype(l asmLine, opcode int) uint16 {
 	if len(l.args) < 3 {
 		a.errorf(l, "%s needs 3 args", l.op)
 		return 0
@@ -324,30 +392,30 @@ func (a *Assembler) itype(l asmLine, op int) uint16 {
 	rd := a.parseReg(l, l.args[0])
 	rs1 := a.parseReg(l, l.args[1])
 	imm := a.parseImm(l, l.args[2])
-	return EncodeI(op, rd, rs1, imm)
+	return op.EncodeI(opcode, rd, rs1, imm)
 }
 
 // loadStore parses "LW rd, imm(rs)" or "LW rd, rs, imm"
-func (a *Assembler) loadStore(l asmLine, op int) uint16 {
+func (a *Assembler) loadStore(l asmLine, opcode int) uint16 {
 	if len(l.args) < 2 {
 		a.errorf(l, "%s needs at least 2 args", l.op)
 		return 0
 	}
 	rd := a.parseReg(l, l.args[0])
 	rs1, imm := a.parseMemArg(l, l.args[1])
-	return EncodeI(op, rd, rs1, imm)
+	return op.EncodeI(opcode, rd, rs1, imm)
 }
 
 // storeInstr parses "SW rs, imm(rd)" -- rs=source, rd=base
-func (a *Assembler) storeInstr(l asmLine, op int) uint16 {
+func (a *Assembler) storeInstr(l asmLine, opcode int) uint16 {
 	if len(l.args) < 2 {
 		a.errorf(l, "%s needs at least 2 args", l.op)
 		return 0
 	}
 	rs := a.parseReg(l, l.args[0])
 	base, imm := a.parseMemArg(l, l.args[1])
-	// SW encoding: EncodeI(op, base_rd, src_rs1, imm)
-	return EncodeI(op, base, rs, imm)
+	// SW encoding: op.EncodeI(opcode, base_rd, src_rs1, imm)
+	return op.EncodeI(opcode, base, rs, imm)
 }
 
 // parseMemArg parses "imm(reg)" or "reg" (imm=0)
@@ -364,7 +432,7 @@ func (a *Assembler) parseMemArg(l asmLine, s string) (reg, imm int) {
 	return a.parseReg(l, s), 0
 }
 
-func (a *Assembler) branch(l asmLine, op, pc int) uint16 {
+func (a *Assembler) branch(l asmLine, opcode, pc int) uint16 {
 	if len(l.args) < 3 {
 		a.errorf(l, "%s needs 3 args", l.op)
 		return 0
@@ -372,24 +440,24 @@ func (a *Assembler) branch(l asmLine, op, pc int) uint16 {
 	rs1 := a.parseReg(l, l.args[0])
 	rs2 := a.parseReg(l, l.args[1])
 	target := a.parseImm(l, l.args[2])
-	off := (target - pc) / 2
-	if off < -32 || off > 31 {
-		a.errorf(l, "branch offset %d out of range (-32..31)", off)
+	off := wordOffset(pc, target)
+	if !branchInRange(off) {
+		a.errorf(l, "branch offset %d out of range (%d..%d)", off, branchMin, branchMax)
 	}
-	return EncodeB(op, rs1, rs2, off)
+	return op.EncodeB(opcode, rs1, rs2, off)
 }
 
-func (a *Assembler) jump(l asmLine, op, pc int) uint16 {
+func (a *Assembler) jump(l asmLine, opcode, pc int) uint16 {
 	if len(l.args) < 1 {
 		a.errorf(l, "%s needs 1 arg", l.op)
 		return 0
 	}
 	target := a.parseImm(l, l.args[0])
-	off := (target - pc) / 2
-	if off < -2048 || off > 2047 {
+	off := wordOffset(pc, target)
+	if !jumpInRange(off) {
 		a.errorf(l, "jump offset %d out of range", off)
 	}
-	return EncodeJ(op, off)
+	return op.EncodeJ(opcode, off)
 }
 
 func (a *Assembler) parseReg(l asmLine, s string) int {

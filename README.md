@@ -14,21 +14,26 @@ Everything is computed using 8.8 fixed-point arithmetic on a 64×32 RGB555 frame
 
 ## Build and Run
 
+The whole toolchain is wrapped in [run.sh](run.sh):
+
 ```bash
-go test ./...                                           # all 49 tests pass
+./run.sh                 # → raytracer_rgb555.png
+```
 
-# Assemble (MiniOS)
-go run ./cmd/asmc -o boot.bin asm/boot.s                # → boot.bin (62 bytes)
+Which runs:
 
-# Compile Forth (raytracer)
-go run ./cmd/forthc -o raytracer.bin asm/raytracer.s    # → raytracer.bin (5,782 bytes)
+```bash
+go test ./...                                                   # all tests pass
 
-# Run (standalone)
-go run ./cmd/nand16 raytracer.bin                       # → raytracer_rgb555.png
+# Assemble the BIOS (loaded at 0x0000)
+go run ./cmd/asmc -o bin/bios.bin asm/bios.s
 
-# Run (OS + app)
-go run ./cmd/forthc -base 0x0200 -o raytracer.bin asm/raytracer.s
-go run ./cmd/nand16 boot.bin raytracer.bin              # boot@0x0000 + app@0x0200
+# Compile the Forth raytracer to assembly, then assemble it for load @ 0x0200
+go run ./cmd/forthc -o bin/raytracer.s asm/raytracer.fth
+go run ./cmd/asmc -base 0x0200 -o bin/raytracer.bin bin/raytracer.s
+
+# Run: BIOS @ 0x0000 + app @ 0x0200
+go run ./cmd/nand16 bin/bios.bin bin/raytracer.bin              # → raytracer_rgb555.png
 ```
 
 ## Architecture Layers
@@ -70,12 +75,13 @@ All are constructed hierarchically from NAND gates.
 | FB | 64×32, mapped at 0xF000 (RGB555) |
 | I/O | UART at 0xF800, Timer at 0xF810 |
 
-### Layer 5 — SoC / MiniOS
+### Layer 5 — SoC / BIOS
 
-`system.go` `os.go` `asm/boot.s`
+`system.go` `asm/bios.s`
 
 SoC integration (CPU + memory + FB + UART + Timer).
-The MiniOS boot code is written in assembly source [asm/boot.s](asm/boot.s) and embedded with `go:embed`.
+The BIOS is plain assembly source ([asm/bios.s](asm/bios.s)) assembled by the `asmc` CLI; it
+boots the machine and provides I/O entirely in software via memory-mapped device registers.
 
 ### Layer 6 — Assembler
 
@@ -179,12 +185,11 @@ nand16/
 ├── cpu_alu.go           # gate-level ALU
 ├── cpu_decode.go        # instruction decoder/encoder
 ├── system.go            # SoC (FB/UART/Timer)
-├── os.go                # MiniOS (go:embed)
 ├── assembler.go         # 2-pass assembler
 ├── forth.go             # Forth cross-compiler
 ├── asm/
-│   ├── boot.s           # MiniOS assembly source
-│   └── raytracer.s      # raytracer Forth source
+│   ├── bios.s           # BIOS assembly source
+│   └── raytracer.fth    # raytracer Forth source
 ├── cmd/
 │   ├── asmc/main.go     # assembler CLI (.s → .bin)
 │   ├── forthc/main.go   # Forth compiler CLI (.s → .bin)

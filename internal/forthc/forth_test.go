@@ -1,18 +1,29 @@
-package nand16
+package forthc
 
 import (
 	"bytes"
+	"nand16/internal/asmc"
+	"nand16/internal/system"
 	"testing"
 )
 
-func runForth(source string) (*System, string) {
+// compileForth runs the Forth front end then the assembler, returning binary.
+func compileForth(source string) ([]byte, error) {
 	fc := NewForthCompiler()
-	code, err := fc.Compile(source, 0)
+	asm, err := fc.Compile(source)
+	if err != nil {
+		return nil, err
+	}
+	return asmc.Assemble(asm)
+}
+
+func runForth(source string) (*system.System, string) {
+	code, err := compileForth(source)
 	if err != nil {
 		return nil, "COMPILE ERROR: " + err.Error()
 	}
 
-	sys := NewSystem()
+	sys := system.NewSystem()
 	sys.LoadRAM(0, code)
 	sys.CPU.PC = 0
 	var out bytes.Buffer
@@ -104,7 +115,7 @@ func TestForth_Pixel(t *testing.T) {
 	if sys == nil {
 		t.Fatal("system is nil")
 	}
-	idx := 3*FBWidth + 5
+	idx := 3*system.FBWidth + 5
 	if sys.FB[idx] != 200 {
 		t.Errorf("FB[%d]=%d, want 200", idx, sys.FB[idx])
 	}
@@ -176,13 +187,12 @@ func TestForth_FixedDiv(t *testing.T) {
 }
 
 // runForthLong runs with a higher instruction limit for the raytracer.
-func runForthLong(source string, maxCycles int) (*System, string) {
-	fc := NewForthCompiler()
-	code, err := fc.Compile(source, 0)
+func runForthLong(source string, maxCycles int) (*system.System, string) {
+	code, err := compileForth(source)
 	if err != nil {
 		return nil, "COMPILE ERROR: " + err.Error()
 	}
-	sys := NewSystem()
+	sys := system.NewSystem()
 	sys.LoadRAM(0, code)
 	sys.CPU.PC = 0
 	var out bytes.Buffer
@@ -222,16 +232,15 @@ halt
 		t.Fatalf("raytracer failed: %s", errStr)
 	}
 
-	centerIdx := 16*FBWidth + 32
+	centerIdx := 16*system.FBWidth + 32
 	if sys.FB[centerIdx] == 0 {
 		t.Errorf("center pixel is black, expected bright (got %d)", sys.FB[centerIdx])
 	}
 	if sys.FB[0] != 0 {
 		t.Errorf("corner should be 0, got %d", sys.FB[0])
 	}
-	t.Logf("Center pixel: %d, Edge pixel (32,4): %d", sys.FB[centerIdx], sys.FB[4*FBWidth+32])
+	t.Logf("Center pixel: %d, Edge pixel (32,4): %d", sys.FB[centerIdx], sys.FB[4*system.FBWidth+32])
 }
-
 
 func TestForth_DoLoop(t *testing.T) {
 	src := `5 0 do i 48 + emit loop halt`

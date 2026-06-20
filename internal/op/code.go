@@ -1,4 +1,4 @@
-package nand16
+package op
 
 // Instruction format constants
 const (
@@ -23,14 +23,14 @@ const (
 
 // Decoded instruction fields
 type Decoded struct {
-	Op   int // 4-bit opcode [15:12]
-	Rd   int // 3-bit [11:9]
-	Rs1  int // 3-bit [8:6]
-	Rs2  int // 3-bit [5:3]
-	Func int // 3-bit [2:0]
-	Imm6 int // 6-bit [5:0] sign-extended to 16
+	Op    int // 4-bit opcode [15:12]
+	Rd    int // 3-bit [11:9]
+	Rs1   int // 3-bit [8:6]
+	Rs2   int // 3-bit [5:3]
+	Func  int // 3-bit [2:0]
+	Imm6  int // 6-bit [5:0] sign-extended to 16
 	Off12 int // 12-bit [11:0] sign-extended to 16
-	Raw  uint16
+	Raw   uint16
 }
 
 // Decode extracts fields from a 16-bit instruction word.

@@ -1,7 +1,7 @@
 ; ============================================
-; MiniOS for NAND-16
+; BIOS for NAND-16
 ; Memory map:
-;   0x0000-0x01FF  MiniOS code
+;   0x0000-0x01FF  BIOS code
 ;   0x0200-0xCFFF  User code + data
 ;   0xD000-0xDFFF  Return stack (4KB, grows down)
 ;   0xE000-0xEFFF  Data stack (4KB, grows down)
@@ -29,10 +29,15 @@ _start:
 
 ; === Utility subroutines ===
 
-; putchar: R2 = character
+; putchar: R2 = character -> UART data port (MMIO)
 os_putchar:
-	addi r1, r0, 1
-	syscall
+	addi r1, r0, -16
+	addi r3, r0, 8
+	shl  r1, r1, r3   ; r1 = 0xF000
+	addi r3, r0, 8
+	shl  r3, r3, r3   ; r3 = 0x0800
+	add  r1, r1, r3   ; r1 = 0xF800 (UART data)
+	sb   r2, 0(r1)
 	ret
 
 ; putpixel: R2=x, R3=y, R4=color -> framebuffer
