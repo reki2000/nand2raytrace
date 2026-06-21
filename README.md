@@ -7,7 +7,8 @@ and a full raytracer, starting from a hierarchical NAND-gate design.
 
 ![raytracer_rgb555](raytracer_rgb555.png)
 
-The output uses quadratic sphere intersection, normal calculation,
+An orbiting camera circles two spheres above a checkerboard ground.
+The renderer uses quadratic sphere intersection, normal calculation,
 Half-Lambert diffuse shading plus Phong specular reflection,
 shadow rays, and a checkerboard ground.
 Everything is computed using 8.8 fixed-point arithmetic on a 64×32 RGB555 framebuffer.
@@ -20,11 +21,12 @@ The whole toolchain is wrapped in [run.sh](run.sh):
 ./run.sh                 # → raytracer_rgb555.png
 ```
 
-Which runs:
+The animation loops forever; the PNG is overwritten every 10,000 CPU ticks, so
+it can be watched live in an auto-reloading image viewer (Ctrl-C to stop).
+
+`run.sh` runs:
 
 ```bash
-go test ./...                                                   # all tests pass
-
 # Assemble the BIOS (loaded at 0x0000)
 go run ./cmd/asmc -o bin/bios.bin asm/bios.s
 
@@ -32,22 +34,28 @@ go run ./cmd/asmc -o bin/bios.bin asm/bios.s
 go run ./cmd/forthc -o bin/raytracer.s asm/raytracer.fth
 go run ./cmd/asmc -base 0x0200 -o bin/raytracer.bin bin/raytracer.s
 
-# Run: BIOS @ 0x0000 + app @ 0x0200
-go run ./cmd/nand16 bin/bios.bin bin/raytracer.bin              # → raytracer_rgb555.png
+# Run: BIOS @ 0x0000 + app @ 0x0200, snapshotting the framebuffer every 10,000 ticks
+go run ./cmd/nand16 -png raytracer_rgb555.png -every 10000 bin/bios.bin bin/raytracer.bin
+```
+
+Run the test suite separately:
+
+```bash
+go test ./...            # 72 tests across all packages
 ```
 
 ## Architecture Layers
 
 ### Layer 1 — Gate Simulator
 
-`wire.go` `gate.go` `flipflop.go` `simulator.go`
+`internal/nand16/`: `wire.go` `gate.go` `flipflop.go` `simulator.go`
 
 An event-driven digital logic simulator built from NMOS-based NAND gates,
 D flip-flops, and buses.
 
 ### Layer 2 — Combinational Logic
 
-`logic_basic.go` `logic_arith.go` `logic_shift.go`
+`internal/nand16/`: `logic_basic.go` `logic_arith.go` `logic_shift.go`
 
 NOT, AND, OR, XOR, MUX, full adders, 16-bit adders/subtractors,
 barrel shifters, and comparators.
@@ -55,13 +63,22 @@ All are constructed hierarchically from NAND gates.
 
 ### Layer 3 — Sequential Circuits
 
-`sequential.go` `module.go`
+`internal/nand16/`: `sequential.go` `membus.go` `module.go`
 
-16-bit registers, a register file (8×16-bit), a program counter, and a memory interface.
+16-bit registers, a register file (8×16-bit), a program counter, and a memory bus port.
 
 ### Layer 4 — CPU: NAND-16
 
-`cpu.go` `cpu_alu.go` `cpu_decode.go`
+The project ships **two interchangeable CPU models** that share the opcode and
+encoding definitions in `internal/op/code.go`:
+
+- **Gate-level** (`internal/nand16/`: `cpu.go` `cpu_alu.go` `cpu_mul.go`) —
+  `GateCPU`, a single-cycle core built entirely from the gate primitives above.
+- **Behavioral** (`internal/cpu/cpu.go`) — a fast Go implementation used to drive
+  the SoC and render the raytracer.
+
+An ALU conformance test (`internal/cpu/alu_conformance_test.go`) and the
+integration tests (`internal/integration/`) keep the two models bit-identical.
 
 | Item | Specification |
 |---|---|
@@ -77,7 +94,7 @@ All are constructed hierarchically from NAND gates.
 
 ### Layer 5 — SoC / BIOS
 
-`system.go` `asm/bios.s`
+`internal/system/`: `system.go` `device.go` + `asm/bios.s`
 
 SoC integration (CPU + memory + FB + UART + Timer).
 The BIOS is plain assembly source ([asm/bios.s](asm/bios.s)) assembled by the `asmc` CLI; it
@@ -85,13 +102,13 @@ boots the machine and provides I/O entirely in software via memory-mapped device
 
 ### Layer 6 — Assembler
 
-`assembler.go`
+`internal/asmc/`: `assembler.go` `emit.go` + `cmd/asmc`
 
 A two-pass assembler supporting labels, all instruction formats, and pseudo-ops.
 
 ### Layer 7 — Forth Cross-Compiler
 
-`forth.go`
+`internal/forthc/forth.go` + `cmd/forthc`
 
 Compiles Forth source into NAND-16 machine code.
 
@@ -123,11 +140,16 @@ which corrupted normal calculations at x/y sign boundaries and caused spheres to
 
 ### Layer 8 — Raytracer
 
-`cmd/nand16/main.go`
+`cmd/nand16/main.go` + `asm/raytracer.fth` + `internal/render`
 
-Real-time raytracing using 8.8 fixed-point arithmetic.
+Real-time raytracing using 8.8 fixed-point arithmetic. The CPU runner drives the
+SoC and snapshots the framebuffer to PNG via `internal/render`.
 
 **Ray generation**: camera origin, pixel → screen coordinates → ray direction `(rx, ry, -256)`
+
+**Orbiting camera**: a 24-entry sine table drives a camera that circles the scene
+(orbit radius 448, centre `(0,0,-448)`, 15° yaw per frame plus a vertical bob);
+the ray direction is rotated by the current yaw each frame.
 
 **Sphere intersection**: quadratic discriminant method with overflow avoidance
 ```
@@ -140,7 +162,7 @@ disc = bh² - a·c,  t = (-bh - √disc) / a
 **Lighting model**: Half-Lambert diffuse + Phong specular reflection (squared)
 ```
 half = (dot(N,L) + 1.0) / 2      ← no terminator line
-total = half × 0.625 + spec² × 0.3 + 0.1
+total = half × 0.625 + spec² × 0.3 + ambient
 channel = base_color × total      ← no hue shift
 ```
 Light source: directional light `L = normalize(-1, 1, 1)` and half-vector `H = normalize(L + V)`
@@ -154,17 +176,19 @@ If the discriminant `dot(oc,L)² - (dot(oc,oc) - r²) ≥ 0` is satisfied, the p
 - Ground: y=-128, checkerboard (bit8 XOR approach, sign-safe)
 - Background: blue gradient + warm horizon
 
-**Forth source**: 6 defined words `isqrt` `fsqrt` `clamp0` `ground-t` `sphere-hit` `shade` `shadow?` plus the main loop
+**Forth source**: 9 defined words `isqrt` `fsqrt` `clamp0` `sin@` `ground-t` `sphere-hit` `shade` `shadow?` `setup-cam`, plus a sine-table init and the main animation loop
 
 ## Numerical Summary
 
 | Item | Value |
 |---|---|
-| Source lines | ~3,970 |
-| Test count | 49 |
-| Behavioral CPU speed | ~20M instructions/sec |
-| Raytracer machine code | 5,782 bytes |
-| Runtime | ~120 ms |
+| Implementation lines (Go) | ~3,200 |
+| Test lines (Go) | ~1,800 |
+| Test count | 72 |
+| Behavioral CPU speed | ~55M instructions/sec |
+| Gate-level ALU | ~3,230 NAND gates |
+| Raytracer machine code | 9,282 bytes |
+| Default run | 500M-cycle budget (~9.5 s wall-clock), animation loops |
 | Resolution | 64×32 RGB555 (15 bit/pixel) |
 | PNG output | 512×256 (8× upscale) |
 
@@ -172,30 +196,38 @@ If the discriminant `dot(oc,L)² - (dot(oc,oc) - r²) ≥ 0` is satisfied, the p
 
 ```
 nand16/
-├── wire.go              # wires and buses
-├── gate.go              # NAND gates
-├── flipflop.go          # D flip-flops
-├── simulator.go         # event-driven simulator
-├── logic_basic.go       # NOT AND OR XOR MUX
-├── logic_arith.go       # adders/subtractors/comparators
-├── logic_shift.go       # barrel shifters
-├── sequential.go        # registers and memory
-├── module.go            # module foundation
-├── cpu.go               # NAND-16 CPU
-├── cpu_alu.go           # gate-level ALU
-├── cpu_decode.go        # instruction decoder/encoder
-├── system.go            # SoC (FB/UART/Timer)
-├── assembler.go         # 2-pass assembler
-├── forth.go             # Forth cross-compiler
-├── asm/
-│   ├── bios.s           # BIOS assembly source
-│   └── raytracer.fth    # raytracer Forth source
+├── internal/
+│   ├── nand16/             # Layers 1–4: gate-level model
+│   │   ├── wire.go             # wires and buses
+│   │   ├── gate.go             # NAND gates
+│   │   ├── flipflop.go         # D flip-flops
+│   │   ├── simulator.go        # event-driven simulator
+│   │   ├── logic_basic.go      # NOT AND OR XOR MUX
+│   │   ├── logic_arith.go      # adders/subtractors/comparators
+│   │   ├── logic_shift.go      # barrel shifters
+│   │   ├── sequential.go       # registers and register file
+│   │   ├── membus.go           # memory bus port
+│   │   ├── module.go           # module foundation
+│   │   ├── cpu.go              # gate-level GateCPU
+│   │   ├── cpu_alu.go          # gate-level ALU
+│   │   └── cpu_mul.go          # gate-level multiplier
+│   ├── op/code.go          # opcode / encoding definitions (shared)
+│   ├── cpu/cpu.go          # behavioral CPU (fast simulation)
+│   ├── memory/memory.go    # 64KB byte-addressed memory
+│   ├── system/             # SoC: system.go + device.go (FB/UART/Timer)
+│   ├── asmc/               # 2-pass assembler (assembler.go, emit.go)
+│   ├── forthc/forth.go     # Forth cross-compiler
+│   ├── render/png.go       # framebuffer → PNG
+│   └── integration/        # cross-model + SoC integration tests
 ├── cmd/
-│   ├── asmc/main.go     # assembler CLI (.s → .bin)
-│   ├── forthc/main.go   # Forth compiler CLI (.s → .bin)
-│   └── nand16/main.go   # CPU runner (.bin → PNG)
-├── *_test.go ×7         # test suite (49 cases)
+│   ├── asmc/main.go        # assembler CLI (.s → .bin)
+│   ├── forthc/main.go      # Forth compiler CLI (.fth → .s)
+│   └── nand16/main.go      # CPU runner (.bin → PNG)
+├── asm/
+│   ├── bios.s              # BIOS assembly source
+│   └── raytracer.fth       # raytracer Forth source
+├── run.sh
 ├── README.md
 ├── go.mod
-└── raytracer_rgb555.png # output image
+└── raytracer_rgb555.png    # output image
 ```

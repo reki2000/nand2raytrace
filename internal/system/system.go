@@ -107,12 +107,21 @@ func (s *System) LoadRAM(addr int, data []byte) {
 
 // Run executes until halt or maxCycles.
 func (s *System) Run(maxCycles int) {
-	for i := 0; i < maxCycles; i++ {
+	s.StepN(maxCycles)
+}
+
+// StepN advances the CPU by up to n cycles, keeping the cycle counter (and thus
+// the timer device) in sync. It returns the number of cycles actually executed
+// and whether the CPU halted before reaching n. This lets a driver interleave
+// execution with other work, e.g. presenting the framebuffer at a fixed rate.
+func (s *System) StepN(n int) (ran int, halted bool) {
+	for i := 0; i < n; i++ {
 		if !s.CPU.Step() {
-			break
+			return i, true
 		}
 		s.cycles++
 	}
+	return n, false
 }
 
 // DumpFB returns framebuffer as ASCII art (for debugging).
