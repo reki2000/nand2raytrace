@@ -13,7 +13,7 @@ package nand16
 // BEQ/BNE/BLT/BGE, JAL, JALR, HALT, NOP. SYSCALL has no hardware effect (it is
 // a NOP); I/O is performed by the OS in software via MMIO.
 type GateCPU struct {
-	sim *Simulator
+	sim SimEngine
 
 	pc       Bus    // program counter (FF outputs)
 	q        [8]Bus // register file outputs (q[0] is constant 0)
@@ -25,6 +25,19 @@ type GateCPU struct {
 	memWrite *Wire
 	byteMode *Wire
 	halt     *Wire
+
+	// Flat-array indices (populated when sim is *FlatSimulator).
+	flat        *FlatSimulator
+	fPC         []int
+	fInstr      []int
+	fMemData    []int
+	fMemAddr    []int
+	fMemWData   []int
+	fQ          [8][]int
+	fMemRead    int
+	fMemWrite   int
+	fByteMode   int
+	fHalt       int
 }
 
 func and4(m *Module, a, b, c, d *Wire) *Wire {
@@ -211,6 +224,30 @@ func NewGateCPU() *GateCPU {
 	return cpu
 }
 
+// NewGateCPUParallel builds a GateCPU that uses the FlatSimulator with
+// goroutine-parallel gate evaluation. workers=0 defaults to runtime.NumCPU().
+func NewGateCPUParallel(workers int) *GateCPU {
+	cpu := NewGateCPU()
+	fs := NewFlatSimulator(cpu.sim.(*Simulator), workers)
+	cpu.sim = fs
+	cpu.flat = fs
+
+	// Precompute flat indices for all I/O wires.
+	cpu.fPC = fs.BusIdx(cpu.pc)
+	cpu.fInstr = fs.BusIdx(cpu.instr)
+	cpu.fMemData = fs.BusIdx(cpu.memData)
+	cpu.fMemAddr = fs.BusIdx(cpu.memAddr)
+	cpu.fMemWData = fs.BusIdx(cpu.memWData)
+	cpu.fMemRead = fs.WireIdx(cpu.memRead)
+	cpu.fMemWrite = fs.WireIdx(cpu.memWrite)
+	cpu.fByteMode = fs.WireIdx(cpu.byteMode)
+	cpu.fHalt = fs.WireIdx(cpu.halt)
+	for i := 0; i < 8; i++ {
+		cpu.fQ[i] = fs.BusIdx(cpu.q[i])
+	}
+	return cpu
+}
+
 // Memory16 is the memory port the CPU drives: word/byte access with the same
 // MMIO semantics as package memory (which satisfies this interface). Keeping it
 // an interface lets the gate core run against the full system memory map
@@ -224,6 +261,10 @@ type Memory16 interface {
 
 // Step executes one instruction against mem. Returns false once halted.
 func (g *GateCPU) Step(mem Memory16) bool {
+	if g.flat != nil {
+		return g.flatStep(mem)
+	}
+
 	g.instr.SetVal(int(mem.Read16(uint16(g.pc.GetVal()))))
 	g.sim.Settle()
 
@@ -253,9 +294,46 @@ func (g *GateCPU) Step(mem Memory16) bool {
 		}
 	}
 
-	for _, ff := range g.sim.FFs { // clock edge: latch PC and registers
-		ff.Tick()
+	g.sim.TickFFs() // clock edge: latch PC and registers
+	return true
+}
+
+// flatStep is the fast path: reads/writes the flat array directly,
+// bypassing Wire.Val and Bus.SetVal/GetVal entirely.
+func (g *GateCPU) flatStep(mem Memory16) bool {
+	fs := g.flat
+
+	// Fetch: read PC from flat, write instruction to flat
+	fs.SetBusVal(g.fInstr, int(mem.Read16(uint16(fs.GetBusVal(g.fPC)))))
+	fs.Settle()
+
+	if fs.WireVal(g.fHalt) {
+		return false
 	}
+
+	if fs.WireVal(g.fMemRead) { // LW / LB
+		addr := uint16(fs.GetBusVal(g.fMemAddr))
+		var d int
+		if fs.WireVal(g.fByteMode) {
+			d = int(mem.Read8(addr))
+		} else {
+			d = int(mem.Read16(addr))
+		}
+		fs.SetBusVal(g.fMemData, d)
+		fs.Settle()
+	}
+
+	if fs.WireVal(g.fMemWrite) { // SW / SB
+		addr := uint16(fs.GetBusVal(g.fMemAddr))
+		wd := uint16(fs.GetBusVal(g.fMemWData))
+		if fs.WireVal(g.fByteMode) {
+			mem.Write8(addr, byte(wd))
+		} else {
+			mem.Write16(addr, wd)
+		}
+	}
+
+	fs.TickFFs()
 	return true
 }
 
@@ -271,10 +349,33 @@ func (g *GateCPU) Run(mem Memory16, maxCycles int) int {
 }
 
 // PC returns the current program counter.
-func (g *GateCPU) PC() int { return g.pc.GetVal() }
+func (g *GateCPU) PC() int {
+	if g.flat != nil {
+		return g.flat.GetBusVal(g.fPC)
+	}
+	return g.pc.GetVal()
+}
 
 // Reg returns the value of register i (R0 is always 0).
-func (g *GateCPU) Reg(i int) uint16 { return uint16(g.q[i].GetVal()) }
+func (g *GateCPU) Reg(i int) uint16 {
+	if g.flat != nil {
+		return uint16(g.flat.GetBusVal(g.fQ[i]))
+	}
+	return uint16(g.q[i].GetVal())
+}
 
 // Halted reports whether the last Step decoded a HALT.
-func (g *GateCPU) Halted() bool { return g.halt.Val }
+func (g *GateCPU) Halted() bool {
+	if g.flat != nil {
+		return g.flat.WireVal(g.fHalt)
+	}
+	return g.halt.Val
+}
+
+// FlatStats returns diagnostic info for the FlatSimulator, or empty string.
+func (g *GateCPU) FlatStats() string {
+	if g.flat != nil {
+		return g.flat.Stats()
+	}
+	return ""
+}

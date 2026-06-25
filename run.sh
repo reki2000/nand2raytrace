@@ -24,6 +24,8 @@ go run ./cmd/asmc -base 0x0200 -o bin/raytracer.bin bin/raytracer.s
 echo "[4/4] Running on the NAND-16 simulator (BIOS @ 0x0000 + app @ 0x0200)..."
 echo "The orbit animation loops forever; $PNG is overwritten every 10000 ticks."
 echo "Open it in an auto-reloading image viewer to watch. Ctrl-C to stop."
-go run ./cmd/nand16 -png "$PNG" -every 10000 bin/bios.bin bin/raytracer.bin
+#go run ./cmd/nand16 -png "$PNG" -every 10000 bin/bios.bin bin/raytracer.bin
+
+go run ./cmd/nand16 -gate -png "$PNG" -every 10000 bin/bios.bin bin/raytracer.bin
 
 echo "Wrote $PNG"

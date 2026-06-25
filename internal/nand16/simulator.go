@@ -2,6 +2,13 @@ package nand16
 
 import "fmt"
 
+// SimEngine is the interface shared by Simulator and FlatSimulator,
+// allowing GateCPU to use either engine transparently.
+type SimEngine interface {
+	Settle()
+	TickFFs()
+}
+
 // Simulator runs cycle-based simulation on a flattened gate list.
 type Simulator struct {
 	Gates  []*Gate     // topologically sorted
@@ -40,6 +47,13 @@ func (s *Simulator) Run(n int) {
 func (s *Simulator) Settle() {
 	for _, g := range s.Gates {
 		g.Eval()
+	}
+}
+
+// TickFFs captures D into Q for all flip-flops.
+func (s *Simulator) TickFFs() {
+	for _, ff := range s.FFs {
+		ff.Tick()
 	}
 }
 

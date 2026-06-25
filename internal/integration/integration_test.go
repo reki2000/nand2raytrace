@@ -137,3 +137,24 @@ func TestGateCPUDrivesSystem(t *testing.T) {
 		t.Errorf("gate CPU UART output = %q, want newline", out.String())
 	}
 }
+
+// TestFlatGateEquivalence runs every program on the flat gate-level CPU
+// and requires identical final register state to the behavioral CPU.
+func TestFlatGateEquivalence(t *testing.T) {
+	for _, p := range programs {
+		t.Run(p.name, func(t *testing.T) {
+			bc := cpu.NewCPU(loadMem(p.code))
+			bc.PC = 0
+			bc.Run(p.cycles)
+
+			g := nand16.NewGateCPUParallel(1)
+			g.Run(loadMem(p.code), p.cycles)
+
+			for r := 1; r < 8; r++ {
+				if bc.Regs[r] != g.Reg(r) {
+					t.Errorf("R%d: behavioral=0x%04X flat=0x%04X", r, bc.Regs[r], g.Reg(r))
+				}
+			}
+		})
+	}
+}
